@@ -59,7 +59,22 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import unicodedata
+
 from harness.middleware import Middleware
+
+
+def _normalize(text: str) -> str:
+    """Chuẩn hoá để so khớp nhưng không thay đổi text gốc của claim."""
+    return " ".join(unicodedata.normalize("NFC", text).casefold().split())
+
+
+def _quotes_one_line(doc, text: str) -> bool:
+    """Claim phải nằm trọn trong một dòng của tài liệu."""
+    expected = _normalize(text)
+    return bool(expected) and any(
+        expected in _normalize(line) for line in doc.body.splitlines()
+    )
 
 
 class CitationChecker(Middleware):
@@ -68,16 +83,60 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        observed = ctx.observed_text
+        fixed_claims = []
+        repaired = 0
+
+        for claim in claims:
+            # Claim sai cấu trúc được giữ lại để Critic chạy sau loại bỏ.
+            if not isinstance(claim, dict):
+                fixed_claims.append(claim)
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text.strip():
+                fixed_claims.append(claim)
+                continue
+
+            doc_id = claim.get("doc_id")
+            cited = ctx.corpus.get(doc_id) if isinstance(doc_id, str) else None
+            if (
+                cited is not None
+                and cited.body in observed
+                and _quotes_one_line(cited, text)
+            ):
+                fixed_claims.append(claim)
+                continue
+
+            # Chỉ tìm trong tài liệu đã được fetch đầy đủ. Nếu không thấy,
+            # không bịa doc_id; Critic sẽ xử lý claim thiếu bằng chứng.
+            source = next(
+                (
+                    doc
+                    for doc in ctx.corpus.docs
+                    if doc.body in observed and _quotes_one_line(doc, text)
+                ),
+                None,
+            )
+            if source is None:
+                fixed_claims.append(claim)
+            else:
+                fixed_claims.append({**claim, "doc_id": source.doc_id})
+                repaired += 1
+
+        report["claims"] = fixed_claims
+        report["citations"] = sorted(
+            {
+                claim["doc_id"]
+                for claim in fixed_claims
+                if isinstance(claim, dict)
+                and isinstance(claim.get("doc_id"), str)
+            }
+        )
+        ctx.state.setdefault("citation_checker", []).append(
+            {"claims": len(fixed_claims), "repaired": repaired}
+        )
+        return report

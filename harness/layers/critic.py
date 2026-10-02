@@ -79,16 +79,78 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        observed = ctx.observed_text
+        docs = ctx.corpus.docs if ctx.corpus is not None else []
+        kept_claims = []
+
+        def observed_source(text):
+            """Tìm tài liệu đã được fetch đầy đủ và chứa nguyên văn text."""
+            return next(
+                (
+                    doc
+                    for doc in docs
+                    if doc.body in observed and text in doc.body
+                ),
+                None,
+            )
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+
+            # Claim có trong quan sát là chữ của mô hình và có bằng chứng:
+            # giữ nguyên hoàn toàn, kể cả dấu câu và khoảng trắng.
+            if text in observed:
+                kept_claims.append(claim)
+                continue
+
+            # Claim không có nguyên vẹn có thể là hai câu từ hai nguồn bị
+            # ghép bằng " và ". Chỉ giữ khi cả hai nửa đều là substring
+            # của hai tài liệu đã quan sát khác nhau.
+            start = 0
+            while True:
+                cut = text.find(" và ", start)
+                if cut < 0:
+                    break
+                left = text[:cut].strip()
+                right = text[cut + len(" và "):].strip()
+                left_doc = observed_source(left) if left else None
+                right_doc = observed_source(right) if right else None
+                if (
+                    left_doc is not None
+                    and right_doc is not None
+                    and left_doc.doc_id != right_doc.doc_id
+                ):
+                    kept_claims.extend(
+                        [
+                            {"text": left, "doc_id": left_doc.doc_id},
+                            {"text": right, "doc_id": right_doc.doc_id},
+                        ]
+                    )
+                    report["abstain"] = True
+                    break
+                start = cut + 1
+            # Không giữ claim nếu không có bằng chứng và cũng không tách được.
+
+        report["claims"] = kept_claims
+        report["citations"] = sorted(
+            {
+                claim["doc_id"]
+                for claim in kept_claims
+                if isinstance(claim.get("doc_id"), str)
+            }
+        )
+
+        if not kept_claims:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ trong các tài liệu đã đọc để kết luận."
+
+        return report
